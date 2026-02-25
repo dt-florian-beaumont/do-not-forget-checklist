@@ -3,6 +3,10 @@ const DATA_ATTR = 'data-dnf-highlight';
 const HEADING_TEXT = 'Reviewer checklist';
 const ARROW_UP_ID = 'dnf-arrow-up';
 const ARROW_DOWN_ID = 'dnf-arrow-down';
+const TITLE_WARNING_ATTR = 'data-dnf-pr-title-warning';
+const STORAGE_KEY_PREFIX = 'dnf-pr:';
+const STORAGE_AREA = chrome.storage.local;
+const HEADING_TEXT_LOWER = HEADING_TEXT.toLowerCase();
 
 const CSS = `
 @keyframes dnf-pulse {
@@ -16,6 +20,10 @@ const CSS = `
 @keyframes dnf-bounce-down {
   0%, 100% { transform: translateY(0) scale(1); box-shadow: 0 2px 8px rgba(239,68,68,0.4); }
   50%       { transform: translateY(7px) scale(1.1); box-shadow: 0 8px 20px rgba(239,68,68,0.6); }
+}
+@keyframes dnf-title-pulse {
+  0%, 100% { color: #EF4444; text-shadow: 0 0 0 rgba(239,68,68,0.5); }
+  50%      { color: #DC2626; text-shadow: 0 0 10px rgba(239,68,68,0.45); }
 }
 input[type="checkbox"][${DATA_ATTR}] {
   will-change: transform;
@@ -36,6 +44,13 @@ input[type="checkbox"][${DATA_ATTR}] {
 }
 .dnf-arrow-up { animation: dnf-bounce-up 1s ease-in-out infinite; }
 .dnf-arrow-down { animation: dnf-bounce-down 1s ease-in-out infinite; }
+[${TITLE_WARNING_ATTR}] {
+  color: #EF4444 !important;
+  animation: dnf-title-pulse 1.2s ease-in-out infinite !important;
+}
+[${TITLE_WARNING_ATTR}] * {
+  color: inherit !important;
+}
 `;
 
 let isActive = true;
@@ -50,6 +65,8 @@ let observerConnected = false;
 const highlightedCheckboxes = new Set();
 let arrowUpEl = null;
 let arrowDownEl = null;
+let currentPrKey = '';
+const lastStoredRemainingByPr = new Map();
 
 function injectStyles() {
   if (document.getElementById(STYLE_ID)) return;
@@ -63,27 +80,111 @@ function removeStyles() {
   document.getElementById(STYLE_ID)?.remove();
 }
 
+function isHeadingTag(tag) {
+  return tag.length === 2 && tag[0] === 'H' && tag >= 'H1' && tag <= 'H6';
+}
+
 /**
- * Scan "Reviewer checklist" sections and return unchecked checkboxes.
+ * Scan "Reviewer checklist" sections and return checklist state.
  * Complexity is O(h + n), where h is heading count and n candidate checkboxes.
  * Perf-sensitive path: this runs on each refresh and should avoid extra global queries.
- * @returns {HTMLInputElement[]}
+ * @returns {{ hasSection: boolean, unchecked: HTMLInputElement[] }}
  */
-function findUncheckedReviewerCheckboxes() {
-  const results = [];
-  for (const heading of document.querySelectorAll('h2')) {
-    if (heading.textContent.trim() !== HEADING_TEXT) continue;
+function findReviewerChecklistState() {
+  const unchecked = [];
+  let hasSection = false;
+  for (const heading of document.querySelectorAll('h1,h2,h3,h4,h5,h6')) {
+    if (heading.textContent.trim().toLowerCase() !== HEADING_TEXT_LOWER) continue;
+    hasSection = true;
     let sibling = heading.nextElementSibling;
     while (sibling) {
       const tag = sibling.tagName;
-      if (tag === 'H1' || tag === 'H2') break;
+      if (isHeadingTag(tag)) break;
       for (const cb of sibling.querySelectorAll('input[type="checkbox"]:not(:checked)')) {
-        results.push(cb);
+        unchecked.push(cb);
       }
       sibling = sibling.nextElementSibling;
     }
   }
-  return results;
+  return { hasSection, unchecked };
+}
+
+function getPrKeyFromLocation() {
+  const match = location.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:\/|$)/);
+  if (!match) return '';
+  return `${match[1]}/${match[2]}/pull/${match[3]}`;
+}
+
+function getStorageKey(prKey) {
+  return `${STORAGE_KEY_PREFIX}${prKey}`;
+}
+
+function setStoredChecklistState(prKey, hasRemaining) {
+  if (!prKey || !STORAGE_AREA) return;
+  const prev = lastStoredRemainingByPr.get(prKey);
+  if (prev === hasRemaining) return;
+  lastStoredRemainingByPr.set(prKey, hasRemaining);
+  const key = getStorageKey(prKey);
+  try {
+    STORAGE_AREA.set({ [key]: { hasRemaining, updatedAt: Date.now() } });
+  } catch (_) {}
+}
+
+function getStoredChecklistState(prKey) {
+  if (!prKey || !STORAGE_AREA) return Promise.resolve(false);
+  const key = getStorageKey(prKey);
+  return new Promise((resolve) => {
+    try {
+      STORAGE_AREA.get(key, (store) => {
+        if (chrome.runtime.lastError) {
+          resolve(false);
+          return;
+        }
+        const hasRemaining = store?.[key]?.hasRemaining === true;
+        lastStoredRemainingByPr.set(prKey, hasRemaining);
+        resolve(hasRemaining);
+      });
+    } catch (_) {
+      resolve(false);
+    }
+  });
+}
+
+function getPrTitleEl() {
+  return (
+    document.querySelector('h1[data-component="PH_Title"]')
+    || document.querySelector('.gh-header-title .js-issue-title')
+    || document.querySelector('.js-issue-title')
+  );
+}
+
+function setTitleWarningVisible(visible) {
+  const titleEl = getPrTitleEl();
+  if (!titleEl) return;
+  if (!visible || !isActive) {
+    titleEl.removeAttribute(TITLE_WARNING_ATTR);
+    return;
+  }
+  injectStyles();
+  titleEl.setAttribute(TITLE_WARNING_ATTR, '');
+}
+
+async function syncTitleWarningFromStorage(prKey) {
+  if (!prKey) {
+    setTitleWarningVisible(false);
+    return;
+  }
+  if (!isActive) {
+    setTitleWarningVisible(false);
+    return;
+  }
+  const hasRemaining = await getStoredChecklistState(prKey);
+  setTitleWarningVisible(hasRemaining);
+}
+
+function resolveCurrentPrKey() {
+  currentPrKey = getPrKeyFromLocation();
+  return currentPrKey;
 }
 
 function clearHighlights() {
@@ -197,12 +298,13 @@ function updateScrollIndicators() {
  * Compute next highlight state and apply minimal DOM diffs.
  * Complexity is O(n) on highlighted and next sets; no full highlight rescan.
  * Invariant: highlightedCheckboxes mirrors DOM nodes carrying DATA_ATTR.
- * @returns {void}
+ * @returns {{ hasSection: boolean, hasRemaining: boolean } | void}
  */
 function applyHighlights() {
   if (!isActive) return;
   injectStyles();
-  const next = new Set(findUncheckedReviewerCheckboxes());
+  const { hasSection, unchecked } = findReviewerChecklistState();
+  const next = new Set(unchecked);
   for (const cb of highlightedCheckboxes) {
     if (!cb.isConnected || !next.has(cb)) {
       cb.removeAttribute(DATA_ATTR);
@@ -215,15 +317,28 @@ function applyHighlights() {
       highlightedCheckboxes.add(cb);
     }
   }
+  if (hasSection) {
+    const prKey = resolveCurrentPrKey();
+    const hasRemaining = next.size > 0;
+    setStoredChecklistState(prKey, hasRemaining);
+    setTitleWarningVisible(hasRemaining);
+    updateScrollIndicators();
+    return { hasSection, hasRemaining };
+  }
   updateScrollIndicators();
+  return { hasSection: false, hasRemaining: false };
 }
 
 function refresh() {
   if (isActive) {
-    applyHighlights();
+    const state = applyHighlights();
+    if (!state?.hasSection) {
+      syncTitleWarningFromStorage(resolveCurrentPrKey());
+    }
   } else {
     clearHighlights();
     clearArrows();
+    setTitleWarningVisible(false);
     removeStyles();
     syncScrollIo([]);
   }
@@ -346,6 +461,16 @@ chrome.runtime.onMessage.addListener((message) => {
     isActive = message.active;
     refresh();
   }
+});
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'local') return;
+  if (!currentPrKey) return;
+  const key = getStorageKey(currentPrKey);
+  if (!(key in changes)) return;
+  const hasRemaining = changes[key].newValue?.hasRemaining === true;
+  lastStoredRemainingByPr.set(currentPrKey, hasRemaining);
+  setTitleWarningVisible(hasRemaining);
 });
 
 document.addEventListener('change', (e) => {
