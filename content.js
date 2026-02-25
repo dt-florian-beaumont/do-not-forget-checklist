@@ -1,14 +1,13 @@
 const STYLE_ID = 'dnf-styles';
 const DATA_ATTR = 'data-dnf-highlight';
 const HEADING_TEXT = 'Reviewer checklist';
-const ARROW_UP_ID   = 'dnf-arrow-up';
+const ARROW_UP_ID = 'dnf-arrow-up';
 const ARROW_DOWN_ID = 'dnf-arrow-down';
 
 const CSS = `
 @keyframes dnf-pulse {
-  0%   { outline-color: #EF4444; outline-offset: 2px; }
-  50%  { outline-color: transparent; outline-offset: 4px; }
-  100% { outline-color: #EF4444; outline-offset: 2px; }
+  0%, 100% { box-shadow: 0 0 0 2px #EF4444; transform: translateZ(0); }
+  50%      { box-shadow: 0 0 0 4px rgba(239,68,68,0.4); transform: translateZ(0); }
 }
 @keyframes dnf-bounce-up {
   0%, 100% { transform: translateY(0) scale(1); box-shadow: 0 2px 8px rgba(239,68,68,0.4); }
@@ -19,14 +18,34 @@ const CSS = `
   50%       { transform: translateY(7px) scale(1.1); box-shadow: 0 8px 20px rgba(239,68,68,0.6); }
 }
 input[type="checkbox"][${DATA_ATTR}] {
-  outline: 2px solid #EF4444 !important;
-  outline-offset: 2px !important;
+  will-change: transform;
+  box-shadow: 0 0 0 2px #EF4444 !important;
   animation: dnf-pulse 1.2s ease-in-out infinite !important;
 }
+.dnf-arrow {
+  position: fixed;
+  left: 40px;
+  top: 120px;
+  width: 64px; height: 64px;
+  background: #EF4444; color: white;
+  border: none; border-radius: 50%;
+  font-size: 32px; cursor: pointer;
+  z-index: 10;
+  box-shadow: 0 2px 8px rgba(239,68,68,0.4);
+  will-change: transform;
+}
+.dnf-arrow-up { animation: dnf-bounce-up 1s ease-in-out infinite; }
+.dnf-arrow-down { animation: dnf-bounce-down 1s ease-in-out infinite; }
 `;
 
 let isActive = true;
 let debounceTimer = null;
+let scrollIo = null;
+const ioVisibilityMap = new Map();
+const REFRESH_DEBOUNCE_MS = 300;
+const CHECKBOX_SETTLE_MS = 700;
+let suspendRefreshUntil = 0;
+let refreshRafId = 0;
 
 function injectStyles() {
   if (document.getElementById(STYLE_ID)) return;
@@ -66,19 +85,8 @@ function clearHighlights() {
 function createArrowEl(id, direction) {
   const el = document.createElement('button');
   el.id = id;
+  el.className = `dnf-arrow dnf-arrow-${direction}`;
   el.textContent = direction === 'up' ? '↑' : '↓';
-  el.style.cssText = `
-    position: fixed;
-    left: 40px;
-    ${direction === 'up' ? 'top: 120px;' : 'top: 120px;'}
-    width: 64px; height: 64px;
-    background: #EF4444; color: white;
-    border: none; border-radius: 50%;
-    font-size: 32px; cursor: pointer;
-    z-index: 10;
-    box-shadow: 0 2px 8px rgba(239,68,68,0.4);
-    animation: ${direction === 'up' ? 'dnf-bounce-up' : 'dnf-bounce-down'} 1s ease-in-out infinite;
-  `;
   el.addEventListener('click', () => scrollToNearestCheckbox(direction));
   return el;
 }
@@ -86,15 +94,16 @@ function createArrowEl(id, direction) {
 function scrollToNearestCheckbox(direction) {
   const all = Array.from(document.querySelectorAll(`input[${DATA_ATTR}]`));
   const vh = window.innerHeight;
+  const withPos = all.map((el) => ({ el, rect: el.getBoundingClientRect() }));
   let target;
   if (direction === 'up') {
-    const above = all.filter(cb => cb.getBoundingClientRect().bottom < 0);
-    above.sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
-    target = above[0];
+    const above = withPos.filter(({ rect }) => rect.bottom < 0);
+    above.sort((a, b) => b.rect.bottom - a.rect.bottom);
+    target = above[0]?.el;
   } else {
-    const below = all.filter(cb => cb.getBoundingClientRect().top > vh);
-    below.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
-    target = below[0];
+    const below = withPos.filter(({ rect }) => rect.top > vh);
+    below.sort((a, b) => a.rect.top - b.rect.top);
+    target = below[0]?.el;
   }
   target?.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
@@ -105,29 +114,24 @@ function clearArrows() {
 }
 
 function updateScrollIndicators() {
-  if (!isActive) { clearArrows(); return; }
-  const all = Array.from(document.querySelectorAll(`input[${DATA_ATTR}]`));
-  const vh = window.innerHeight;
-  const hasAbove = all.some(cb => cb.getBoundingClientRect().bottom < 0);
-  const hasBelow = all.some(cb => cb.getBoundingClientRect().top > vh);
-
-  if (hasAbove && !document.getElementById(ARROW_UP_ID))
-    document.body.appendChild(createArrowEl(ARROW_UP_ID, 'up'));
-  else if (!hasAbove)
-    document.getElementById(ARROW_UP_ID)?.remove();
-
-  if (hasBelow && !document.getElementById(ARROW_DOWN_ID))
-    document.body.appendChild(createArrowEl(ARROW_DOWN_ID, 'down'));
-  else if (!hasBelow)
-    document.getElementById(ARROW_DOWN_ID)?.remove();
+  if (!isActive) {
+    clearArrows();
+    syncScrollIo([]);
+    return;
+  }
+  const checkboxes = Array.from(document.querySelectorAll(`input[${DATA_ATTR}]`));
+  syncScrollIo(checkboxes);
 }
 
 function applyHighlights() {
-  clearHighlights();
   if (!isActive) return;
   injectStyles();
-  findUncheckedReviewerCheckboxes().forEach((cb) => {
-    cb.setAttribute(DATA_ATTR, '');
+  const next = new Set(findUncheckedReviewerCheckboxes());
+  document.querySelectorAll(`input[${DATA_ATTR}]`).forEach((cb) => {
+    if (!next.has(cb)) cb.removeAttribute(DATA_ATTR);
+  });
+  next.forEach((cb) => {
+    if (!cb.hasAttribute(DATA_ATTR)) cb.setAttribute(DATA_ATTR, '');
   });
   updateScrollIndicators();
 }
@@ -139,6 +143,7 @@ function refresh() {
     clearHighlights();
     clearArrows();
     removeStyles();
+    syncScrollIo([]);
   }
 }
 
@@ -150,24 +155,120 @@ chrome.runtime.onMessage.addListener((message) => {
   }
 });
 
+function scheduleRefresh(delay = REFRESH_DEBOUNCE_MS) {
+  clearTimeout(debounceTimer);
+  const wait = Math.max(delay, suspendRefreshUntil - Date.now(), 0);
+  debounceTimer = setTimeout(() => {
+    debounceTimer = null;
+    // Let GitHub finish its own render + scroll restore first.
+    requestAnimationFrame(() => requestAnimationFrame(refresh));
+  }, wait);
+}
+
+function queueRefresh() {
+  if (refreshRafId) return;
+  refreshRafId = requestAnimationFrame(() => {
+    refreshRafId = 0;
+    refresh();
+  });
+}
+
+// Freeze extension refresh shortly after a checkbox interaction.
+document.addEventListener('change', (e) => {
+  const target = e.target;
+  if (!(target instanceof HTMLInputElement) || target.type !== 'checkbox') return;
+  suspendRefreshUntil = Date.now() + CHECKBOX_SETTLE_MS;
+  scheduleRefresh(CHECKBOX_SETTLE_MS);
+}, true);
+
 // MutationObserver with debounce to handle dynamic DOM changes
 const observer = new MutationObserver(() => {
-  clearTimeout(debounceTimer);
-  debounceTimer = setTimeout(refresh, 300);
+  scheduleRefresh();
 });
 
-observer.observe(document.body, { childList: true, subtree: true });
+function connectObserver() {
+  observer.observe(document.body, { childList: true, subtree: true });
+}
 
-// Handle GitHub SPA navigation (Turbo)
-document.addEventListener('turbo:load', refresh);
-document.addEventListener('turbo:render', refresh);
+// Turbo: disconnect before body replace to avoid memory leak
+document.addEventListener('turbo:before-render', (e) => {
+  if (e.detail?.renderMethod === 'replace') {
+    observer.disconnect();
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
+    if (refreshRafId) {
+      cancelAnimationFrame(refreshRafId);
+      refreshRafId = 0;
+    }
+    suspendRefreshUntil = 0;
+    scrollIo?.disconnect();
+    scrollIo = null;
+    ioVisibilityMap.clear();
+  }
+});
 
-// Scroll listener with debounce to update arrow indicators
-let scrollTimer = null;
-window.addEventListener('scroll', () => {
-  clearTimeout(scrollTimer);
-  scrollTimer = setTimeout(updateScrollIndicators, 100);
-}, { passive: true });
+// Turbo: reconnect after new body
+document.addEventListener('turbo:load', () => {
+  connectObserver();
+  queueRefresh();
+});
+document.addEventListener('turbo:render', queueRefresh);
+
+// IntersectionObserver: update arrows when visibility changes (replaces scroll listener)
+function syncScrollIo(checkboxes) {
+  const set = new Set(checkboxes);
+  const prev = new Set(scrollIo ? ioVisibilityMap.keys() : []);
+  if (set.size === 0) {
+    scrollIo?.disconnect();
+    scrollIo = null;
+    ioVisibilityMap.clear();
+    clearArrows();
+    return;
+  }
+  const vh = window.innerHeight;
+  const updateFromEntries = (entries) => {
+    for (const e of entries) {
+      const { bottom, top } = e.boundingClientRect;
+      ioVisibilityMap.set(e.target, { above: bottom < 0, below: top > vh });
+    }
+    const hasAbove = [...ioVisibilityMap.values()].some((v) => v.above);
+    const hasBelow = [...ioVisibilityMap.values()].some((v) => v.below);
+    if (hasAbove && !document.getElementById(ARROW_UP_ID))
+      document.body.appendChild(createArrowEl(ARROW_UP_ID, 'up'));
+    else if (!hasAbove) document.getElementById(ARROW_UP_ID)?.remove();
+    if (hasBelow && !document.getElementById(ARROW_DOWN_ID))
+      document.body.appendChild(createArrowEl(ARROW_DOWN_ID, 'down'));
+    else if (!hasBelow) document.getElementById(ARROW_DOWN_ID)?.remove();
+  };
+  if (!scrollIo) {
+    scrollIo = new IntersectionObserver(updateFromEntries, { root: null, rootMargin: '0px', threshold: 0 });
+  }
+  for (const el of prev) {
+    if (!set.has(el)) {
+      scrollIo.unobserve(el);
+      ioVisibilityMap.delete(el);
+    }
+  }
+  for (const el of set) {
+    if (!prev.has(el)) {
+      const rect = el.getBoundingClientRect();
+      ioVisibilityMap.set(el, { above: rect.bottom < 0, below: rect.top > vh });
+      scrollIo.observe(el);
+    }
+  }
+  if (set.size > 0) {
+    const hasAbove = [...ioVisibilityMap.values()].some((v) => v.above);
+    const hasBelow = [...ioVisibilityMap.values()].some((v) => v.below);
+    if (hasAbove && !document.getElementById(ARROW_UP_ID))
+      document.body.appendChild(createArrowEl(ARROW_UP_ID, 'up'));
+    else if (!hasAbove) document.getElementById(ARROW_UP_ID)?.remove();
+    if (hasBelow && !document.getElementById(ARROW_DOWN_ID))
+      document.body.appendChild(createArrowEl(ARROW_DOWN_ID, 'down'));
+    else if (!hasBelow) document.getElementById(ARROW_DOWN_ID)?.remove();
+  }
+}
+
+connectObserver();
 
 // Init: read stored state and apply
 chrome.storage.session.get('active').then(({ active }) => {
