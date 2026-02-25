@@ -69,13 +69,13 @@ function createArrowEl(id, direction) {
   el.textContent = direction === 'up' ? '↑' : '↓';
   el.style.cssText = `
     position: fixed;
-    right: 20px;
-    ${direction === 'up' ? 'top: 20px' : 'bottom: 20px'};
-    width: 44px; height: 44px;
+    left: 40px;
+    ${direction === 'up' ? 'top: 120px;' : 'top: 120px;'}
+    width: 64px; height: 64px;
     background: #EF4444; color: white;
     border: none; border-radius: 50%;
-    font-size: 22px; cursor: pointer;
-    z-index: 2147483647;
+    font-size: 32px; cursor: pointer;
+    z-index: 10;
     box-shadow: 0 2px 8px rgba(239,68,68,0.4);
     animation: ${direction === 'up' ? 'dnf-bounce-up' : 'dnf-bounce-down'} 1s ease-in-out infinite;
   `;
