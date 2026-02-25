@@ -91,6 +91,12 @@ function createArrowEl(id, direction) {
   return el;
 }
 
+/**
+ * Find the next highlighted checkbox and scroll to it.
+ * It uses element positions to pick the closest one above or below.
+ * The final scroll is centered for better reading.
+ * @param {'up'|'down'} direction
+ */
 function scrollToNearestCheckbox(direction) {
   const all = Array.from(document.querySelectorAll(`input[${DATA_ATTR}]`));
   const vh = window.innerHeight;
@@ -105,7 +111,12 @@ function scrollToNearestCheckbox(direction) {
     below.sort((a, b) => a.rect.top - b.rect.top);
     target = below[0]?.el;
   }
-  target?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  if (!target) return;
+  const top = Math.max(
+    0,
+    window.scrollY + target.getBoundingClientRect().top - (window.innerHeight / 2) + (target.offsetHeight / 2),
+  );
+  window.scrollTo({ top, behavior: 'smooth' });
 }
 
 function clearArrows() {
@@ -147,7 +158,6 @@ function refresh() {
   }
 }
 
-// Listen for toggle messages from background.js
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === 'TOGGLE') {
     isActive = message.active;
@@ -160,11 +170,19 @@ function scheduleRefresh(delay = REFRESH_DEBOUNCE_MS) {
   const wait = Math.max(delay, suspendRefreshUntil - Date.now(), 0);
   debounceTimer = setTimeout(() => {
     debounceTimer = null;
-    // Let GitHub finish its own render + scroll restore first.
+    /**
+     * Two requestAnimationFrame calls help us wait until
+     * GitHub finishes its own render and scroll restore.
+     */
     requestAnimationFrame(() => requestAnimationFrame(refresh));
   }, wait);
 }
 
+/**
+ * Queue one refresh per frame.
+ * This avoids duplicate refresh calls when Turbo events
+ * fire very close to each other.
+ */
 function queueRefresh() {
   if (refreshRafId) return;
   refreshRafId = requestAnimationFrame(() => {
@@ -173,7 +191,6 @@ function queueRefresh() {
   });
 }
 
-// Freeze extension refresh shortly after a checkbox interaction.
 document.addEventListener('change', (e) => {
   const target = e.target;
   if (!(target instanceof HTMLInputElement) || target.type !== 'checkbox') return;
@@ -181,7 +198,6 @@ document.addEventListener('change', (e) => {
   scheduleRefresh(CHECKBOX_SETTLE_MS);
 }, true);
 
-// MutationObserver with debounce to handle dynamic DOM changes
 const observer = new MutationObserver(() => {
   scheduleRefresh();
 });
@@ -190,7 +206,6 @@ function connectObserver() {
   observer.observe(document.body, { childList: true, subtree: true });
 }
 
-// Turbo: disconnect before body replace to avoid memory leak
 document.addEventListener('turbo:before-render', (e) => {
   if (e.detail?.renderMethod === 'replace') {
     observer.disconnect();
@@ -207,14 +222,20 @@ document.addEventListener('turbo:before-render', (e) => {
   }
 });
 
-// Turbo: reconnect after new body
 document.addEventListener('turbo:load', () => {
   connectObserver();
   queueRefresh();
 });
-document.addEventListener('turbo:render', queueRefresh);
+document.addEventListener('turbo:render', () => {
+  queueRefresh();
+});
 
-// IntersectionObserver: update arrows when visibility changes (replaces scroll listener)
+/**
+ * Keep IntersectionObserver targets in sync with current checkboxes.
+ * It updates arrow visibility using cached visibility state to avoid
+ * heavy scroll listeners and extra layout work.
+ * @param {HTMLInputElement[]} checkboxes
+ */
 function syncScrollIo(checkboxes) {
   const set = new Set(checkboxes);
   const prev = new Set(scrollIo ? ioVisibilityMap.keys() : []);
@@ -270,8 +291,4 @@ function syncScrollIo(checkboxes) {
 
 connectObserver();
 
-// Init: read stored state and apply
-chrome.storage.session.get('active').then(({ active }) => {
-  isActive = active !== false; // undefined → true
-  refresh();
-});
+refresh();
